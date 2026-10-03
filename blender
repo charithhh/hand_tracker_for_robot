@@ -1,0 +1,99 @@
+import bpy                       # Blender's Python API
+import socket                    # to receive the UDP packets
+import math
+import mathutils                 # used only to set the 3D view angle
+
+# ================= SETTINGS =================
+UDP_IP, UDP_PORT = "127.0.0.1", 5005                     # must match UDP_ADDR in hand_tracker.py
+RIG_NAME = "HandRig"                                     # name of the Armature OBJECT in Blender
+BONE_NAMES = ["Thumb", "Index", "Middle", "Ring", "Pinky"]   # bone names, same order as the data (thumb..pinky)
+MAX_BEND_DEG = 90.0                                      # servo 180 -> bone rotates this many degrees
+CURL_AXIS = 0                                            # bone-local axis to curl around: 0=X, 1=Y, 2=Z
+CURL_SIGN = 1                                            # set to -1 if fingers bend the wrong way
+
+# ================= OPTIONAL TEST RIG =================
+def build_test_rig():
+    """Creates a simple armature with 5 bones so you can test without your own model."""
+    if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')            # edit-mode changes need to start from object mode
+    arm = bpy.data.armatures.new("HandArmature")          # armature DATA (the skeleton definition)
+    rig = bpy.data.objects.new(RIG_NAME, arm)             # armature OBJECT (what you see in the scene)
+    bpy.context.collection.objects.link(rig)              # add it to the scene
+    bpy.context.view_layer.objects.active = rig           # make it the active object
+    bpy.ops.object.mode_set(mode='EDIT')                  # bones can only be created in Edit Mode
+    for i, name in enumerate(BONE_NAMES):
+        bone = arm.edit_bones.new(name)
+        bone.head = ((i - 2) * 0.3, 0, 0)                 # bone start, spread along X
+        bone.tail = ((i - 2) * 0.3, 0, 0.8)               # bone end, pointing up
+    bpy.ops.object.mode_set(mode='OBJECT')                # back to normal mode
+    rig.show_in_front = True                              # draw bones even if inside other objects
+
+def set_3d_view():
+    """Angles the 3D viewport so the finger curl is easy to see."""
+    try:
+        for area in bpy.context.screen.areas:
+            if area.type == 'VIEW_3D':
+                r3d = area.spaces.active.region_3d
+                r3d.view_perspective = 'PERSP'
+                r3d.view_rotation = mathutils.Euler((math.radians(75), 0, math.radians(40))).to_quaternion()
+                r3d.view_distance = 4.0
+                r3d.view_location = (0, 0, 0.4)
+    except Exception:
+        pass                                              # view tweak is cosmetic; ignore failures
+
+# ================= SET UP =================
+if RIG_NAME not in bpy.data.objects:                      # no rig? build the test one
+    build_test_rig()
+    set_3d_view()
+rig = bpy.data.objects[RIG_NAME]
+
+ns = bpy.app.driver_namespace                             # a dict that survives re-running the script
+run_id = object()                                         # unique token for THIS run
+ns["hand_run_id"] = run_id                                # older runs see a different token and stop themselves
+old_sock = ns.get("hand_sock")
+if old_sock:
+    old_sock.close()                                      # free the port from a previous run
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)   # UDP socket
+sock.bind((UDP_IP, UDP_PORT))                             # start listening on the port
+sock.setblocking(False)                                   # never freeze Blender waiting for data
+ns["hand_sock"] = sock
+
+# ================= THE LISTENER (runs every 20 ms) =================
+def poll():
+    if ns.get("hand_run_id") is not run_id:               # a newer run started, or we were told to stop
+        sock.close()
+        return None                                       # returning None cancels the timer
+
+    latest = None
+    try:
+        while True:                                       # drain the queue, keep only the NEWEST packet
+            latest, _ = sock.recvfrom(256)
+    except BlockingIOError:
+        pass                                              # queue empty: normal
+    except OSError:
+        pass
+
+    if latest:
+        try:
+            angles = [float(v) for v in latest.decode().strip().split(",")]   # "0,90,180,45,10" -> [0.0, 90.0, ...]
+        except ValueError:
+            angles = []                                   # garbled packet: ignore
+        if len(angles) == 5:
+            for name, servo_deg in zip(BONE_NAMES, angles):
+                pb = rig.pose.bones.get(name)             # pose bone = the animatable version of the bone
+                if pb is None:
+                    continue                              # bone name not found: skip
+                pb.rotation_mode = 'XYZ'                  # use simple Euler rotation
+                euler = [0.0, 0.0, 0.0]
+                bend = servo_deg / 180.0 * MAX_BEND_DEG   # scale servo angle to bone bend angle
+                euler[CURL_AXIS] = CURL_SIGN * math.radians(bend)
+                pb.rotation_euler = euler                 # apply the rotation
+            for area in bpy.context.screen.areas:         # ask Blender to redraw the 3D views
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+    return 0.02                                           # run again in 0.02 seconds
+
+bpy.app.timers.register(poll, first_interval=0.1)         # start the repeating listener
+print(f"Listening for hand data on udp://{UDP_IP}:{UDP_PORT}")
+# TO STOP: run this line in Blender's Python console ->  bpy.app.driver_namespace["hand_run_id"] = None
